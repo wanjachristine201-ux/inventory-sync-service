@@ -31,9 +31,24 @@ This service provides real-time inventory visibility for Northstar Retail Co. su
 
 ---
 
-## Scope Delta Analysis ( Day 4 Pivot)
+## Scope Delta Analysis (Day 4 Pivot)
 
-> *This section will document architectural changes, dropped features, and trade-offs when the non-negotiable client pivot is announced.*
+* **Dropped Features:**
+  * Synchronous REST print call that blocked the UI while waiting for printer confirmation.
+  * Periodic background polling using `APScheduler`[cite: 1].
+
+* **Added Features:**
+  * `POST /webhook/print-completed` callback endpoint.
+  * `HMAC-SHA256` signature verification (`X-Signature` header validation) to secure webhook calls.
+  * Asynchronous queue processing using FastAPI `BackgroundTasks`.
+
+* **Modified Features:**
+  * `POST /check-in` endpoint now immediately sets status to `PENDING` and returns, instead of waiting for a completed print job.
+  * Kiosk UI now polls/queries `GET /attendee/{attendee_id}` to reflect state changes.
+
+* **Architectural Trade-offs & Duplicate Protection:**
+  * **Trade-off:** The system transitions from strong immediate consistency to eventual consistency. The UI cannot show "Checked In" right away and must handle a `PENDING` state.
+  * **Duplicate Protection:** State-based locking on `attendees_db`. Any scan attempt for an attendee already in `PENDING` or `CHECKED_IN` state returns an HTTP 400 error immediately, preventing double badge prints even if webhooks arrive out of order.
 
 # Solstice Events - Live Check-In & Webhook Service
 
