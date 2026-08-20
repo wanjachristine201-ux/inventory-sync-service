@@ -1,62 +1,134 @@
-from fastapi import FastAPI, HTTPException
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import httpx
-from datetime import datetime
+import hmac
+import hashlib
+import os
+import asyncio
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from pydantic import BaseModel
+from dotenv import load_dotenv
 
-app = FastAPI(title="Northstar Live Inventory Sync Service")
+load_dotenv()
 
-inventory_cache = {
-    "ITEM-101": {"name": "Wireless Mouse", "stock": 45, "last_updated": "Initial"},
-    "ITEM-102": {"name": "Mechanical Keyboard", "stock": 12, "last_updated": "Initial"}
+app = FastAPI(title="Solstice Events - Asynchronous Check-In & Webhook Service")
+
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "solstice_secret_key_123")
+
+attendees_db = {
+    "ATT-001": {"name": "Alice Johnson", "status": "NOT_CHECKED_IN", "badge_printed": False},
+    "ATT-002": {"name": "Bob Smith", "status": "NOT_CHECKED_IN", "badge_printed": False},
+    "ATT-003": {"name": "Charlie Brown", "status": "NOT_CHECKED_IN", "badge_printed": False},
 }
 
-scheduler = AsyncIOScheduler()
+message_queue = []
 
-@app.get("/mock-warehouse/stock", tags=["Mock Warehouse"])
-def mock_warehouse_api():
-    """Simulates an external warehouse API returning stock levels."""
-    return {
-        "ITEM-101": {"name": "Wireless Mouse", "stock": 50},
-        "ITEM-102": {"name": "Mechanical Keyboard", "stock": 8}
-    }
+class CheckInRequest(BaseModel):
+    attendee_id: str
 
-async def poll_warehouse_stock():
-    """Polls warehouse API every interval to sync local inventory cache."""
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get("http://127.0.0.1:8000/mock-warehouse/stock")
-            if response.status_code == 200:
-                data = response.json()
-                for item_id, details in data.items():
-                    inventory_cache[item_id] = {
-                        "name": details["name"],
-                        "stock": details["stock"],
-                        "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    }
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] [POLL] Sync complete. Cache updated.")
-    except Exception as e:
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] [POLL ERROR] Failed: {e}")
+class WebhookPayload(BaseModel):
+    attendee_id: str
+    status: str
 
-@app.on_event("startup")
-def start_scheduler():
+
+def verify_signature(body_bytes: bytes, x_signature: str | None) -> bool:
+    if not x_signature:
+        return False
+    expected_hash = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        body_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected_hash, x_signature)
+
+
+async def process_queue_and_send_webhook(attendee_id: str, raw_payload: str):
+    """Simulates vendor picking up job from queue and sending back a signed webhook."""
+    await asyncio.sleep(3)  # Simulate processing delay
     
-    scheduler.add_job(poll_warehouse_stock, "interval", seconds=30, id="warehouse_poll_job")
-    scheduler.start()
+    signature = hmac.new(
+        WEBHOOK_SECRET.encode("utf-8"),
+        raw_payload.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
 
-@app.on_event("shutdown")
-def shutdown_scheduler():
-    scheduler.shutdown()
+    import httpx
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            "http://127.0.0.1:8000/webhook/print-completed",
+            content=raw_payload,
+            headers={
+                "Content-Type": "application/json",
+                "X-Signature": signature
+            }
+        )
 
-@app.get("/inventory/{item_id}", tags=["Support Tool API"])
-def query_inventory(item_id: str):
-    """Allows support tools to query item stock levels."""
-    if item_id not in inventory_cache:
-        raise HTTPException(status_code=404, detail="Item not found in inventory")
+
+@app.post("/check-in", tags=["Kiosk"])
+async def scan_attendee(request: CheckInRequest, background_tasks: BackgroundTasks):
+    """
+    Handles attendee QR scan.
+    Prevents duplicate scans and publishes print job to queue.
+    """
+    attendee_id = request.attendee_id
+
+    if attendee_id not in attendees_db:
+        raise HTTPException(status_code=404, detail="Attendee not found")
+
+    attendee = attendees_db[attendee_id]
+
+    if attendee["status"] in ["PENDING", "CHECKED_IN"]:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Duplicate scan rejected. Attendee is already in state: {attendee['status']}"
+        )
+
+    attendee["status"] = "PENDING"
+    
+    payload_str = f'{{"attendee_id": "{attendee_id}", "status": "PRINT_COMPLETED"}}'
+    message_queue.append({"attendee_id": attendee_id, "payload": payload_str})
+
+    background_tasks.add_task(process_queue_and_send_webhook, attendee_id, payload_str)
+
     return {
-        "item_id": item_id,
-        "data": inventory_cache[item_id]
+        "message": "Scan accepted. Print job queued.",
+        "attendee_id": attendee_id,
+        "status": attendee["status"]
     }
+
+@app.post("/webhook/print-completed", tags=["Vendor Webhook"])
+async def handle_print_completed_webhook(
+    payload: WebhookPayload,
+    request: BackgroundTasks, # Used to access request body
+    x_signature: str | None = Header(None)
+):
+    """
+    Receives vendor webhook callback, verifies HMAC signature, and completes check-in.
+    """
+
+    raw_body = f'{{"attendee_id": "{payload.attendee_id}", "status": "{payload.status}"}}'.encode("utf-8")
+
+    if not verify_signature(raw_body, x_signature):
+        raise HTTPException(status_code=401, detail="Invalid or missing webhook signature")
+
+    attendee = attendees_db.get(payload.attendee_id)
+    if not attendee:
+        raise HTTPException(status_code=404, detail="Attendee not found")
+
+    attendee["status"] = "CHECKED_IN"
+    attendee["badge_printed"] = True
+
+    return {
+        "message": "Webhook processed successfully",
+        "attendee_id": payload.attendee_id,
+        "current_status": attendee["status"]
+    }
+
+@app.get("/attendee/{attendee_id}", tags=["Kiosk UI"])
+def get_attendee_status(attendee_id: str):
+    """Exposes status for Kiosk UI polling."""
+    if attendee_id not in attendees_db:
+        raise HTTPException(status_code=404, detail="Attendee not found")
+    return {"attendee_id": attendee_id, "data": attendees_db[attendee_id]}
+
 
 @app.get("/", tags=["Health Check"])
 def root():
-    return {"status": "Active", "service": "Live Inventory Sync"}
+    return {"status": "Active", "service": "Solstice Events Check-In Service"}
